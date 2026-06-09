@@ -1,0 +1,212 @@
+WITH clean_table AS (
+    SELECT
+        PARSE_DATETIME('%m/%d/%Y %I:%M %p', `Accident Date_Time`) AS accident_datetime,
+
+        `Operator Name` AS operator_name,
+        `Accident State` AS accident_state,
+        `Accident Latitude` AS accident_latitude,
+        `Accident Longitude` AS accident_longitude,
+
+        `Cause Category` AS cause_category,
+        `Pipeline Type` AS pipeline_type,
+
+        `Net Loss _Barrels_` AS net_loss_barrels,
+        `All Costs` AS all_costs,
+        `All Fatalities` AS all_fatalities,
+        `All Injuries` AS all_injuries,
+        `Public Injuries` AS public_injuries,
+
+        `Pipeline Shutdown` AS pipeline_shutdown,
+
+        EXTRACT(YEAR FROM PARSE_DATETIME('%m/%d/%Y %I:%M %p', `Accident Date_Time`)) AS accident_year,
+        EXTRACT(MONTH FROM PARSE_DATETIME('%m/%d/%Y %I:%M %p', `Accident Date_Time`)) AS accident_month,
+        EXTRACT(DAY FROM PARSE_DATETIME('%m/%d/%Y %I:%M %p', `Accident Date_Time`)) AS accident_day
+
+    FROM `fluted-magpie-496405-p9.oil_spills.NOAA Oil Spill Incidents`
+),
+
+
+monthly_incidents AS (
+    SELECT
+        accident_year,
+        accident_month,
+
+        COUNT(*) AS monthly_incident_count,
+        SUM(all_costs) AS monthly_total_cost,
+        SUM(all_fatalities) AS monthly_total_fatalities,
+        SUM(all_injuries) AS monthly_total_injuries,
+        SUM(net_loss_barrels) AS monthly_total_barrels_lost
+
+    FROM clean_table
+    GROUP BY accident_year, accident_month
+),
+
+
+rolling_trends AS (
+    SELECT
+        *,
+
+        SUM(monthly_incident_count) OVER (
+            ORDER BY accident_year, accident_month
+            ROWS BETWEEN 11 PRECEDING AND CURRENT ROW
+        ) AS rolling_12_month_incidents,
+
+        SUM(monthly_total_cost) OVER (
+            ORDER BY accident_year, accident_month
+            ROWS BETWEEN 11 PRECEDING AND CURRENT ROW
+        ) AS rolling_12_month_costs
+
+    FROM monthly_incidents
+),
+
+
+yearly_totals AS (
+    SELECT
+        accident_year,
+
+        COUNT(*) AS yearly_incidents,
+        SUM(all_costs) AS yearly_costs,
+        SUM(all_fatalities) AS yearly_fatalities
+
+    FROM clean_table
+    GROUP BY accident_year
+),
+
+yearly_growth AS (
+    SELECT
+        *,
+
+        LAG(yearly_incidents) OVER (
+            ORDER BY accident_year
+        ) AS previous_year_incidents,
+
+        ROUND(
+            SAFE_DIVIDE(
+                yearly_incidents - LAG(yearly_incidents) OVER (ORDER BY accident_year),
+                LAG(yearly_incidents) OVER (ORDER BY accident_year)
+            ) * 100,
+            2
+        ) AS incident_growth_pct
+
+    FROM yearly_totals
+),
+
+
+spike_detection AS (
+    SELECT
+        *,
+
+        AVG(yearly_incidents) OVER () AS historical_avg_incidents,
+        STDDEV(yearly_incidents) OVER () AS historical_stddev_incidents,
+
+        CASE
+            WHEN yearly_incidents >
+                 AVG(yearly_incidents) OVER ()
+                 + (1.5 * STDDEV(yearly_incidents) OVER ())
+            THEN 'SPIKE DETECTED'
+
+            ELSE 'NORMAL'
+        END AS anomaly_status
+
+    FROM yearly_growth
+),
+
+
+operator_risk AS (
+    SELECT
+        operator_name,
+
+        COUNT(*) AS total_incidents,
+        SUM(all_costs) AS total_costs,
+        SUM(all_fatalities) AS total_fatalities,
+        SUM(all_injuries) AS total_injuries,
+        SUM(net_loss_barrels) AS total_barrels_lost,
+
+        DENSE_RANK() OVER (
+            ORDER BY
+                COUNT(*) DESC,
+                SUM(all_costs) DESC,
+                SUM(all_fatalities) DESC
+        ) AS operator_risk_rank
+
+    FROM clean_table
+    GROUP BY operator_name
+),
+
+
+state_risk AS (
+    SELECT
+        accident_state,
+
+        COUNT(*) AS total_incidents,
+        SUM(all_costs) AS total_costs,
+        SUM(all_fatalities) AS total_fatalities,
+        SUM(net_loss_barrels) AS total_barrels_lost
+
+    FROM clean_table
+    GROUP BY accident_state
+),
+
+ranked_states AS (
+    SELECT
+        *,
+
+        DENSE_RANK() OVER (
+            ORDER BY total_incidents DESC
+        ) AS state_risk_rank
+
+    FROM state_risk
+),
+
+
+cause_analysis AS (
+    SELECT
+        cause_category,
+
+        COUNT(*) AS total_incidents,
+        SUM(all_costs) AS total_costs,
+        SUM(all_fatalities) AS total_fatalities
+
+    FROM clean_table
+    GROUP BY cause_category
+)
+
+
+SELECT
+    rt.accident_year,
+    rt.accident_month,
+
+    rt.monthly_incident_count,
+    rt.monthly_total_cost,
+    rt.monthly_total_fatalities,
+    rt.monthly_total_injuries,
+    rt.monthly_total_barrels_lost,
+
+    rt.rolling_12_month_incidents,
+    rt.rolling_12_month_costs,
+
+    sd.incident_growth_pct,
+    sd.anomaly_status,
+
+    op.operator_name AS highest_risk_operator,
+    op.total_incidents AS operator_total_incidents,
+    op.total_costs AS operator_total_costs,
+    op.operator_risk_rank,
+
+    rs.accident_state AS highest_risk_state,
+    rs.total_incidents AS state_total_incidents,
+    rs.total_costs AS state_total_costs,
+    rs.state_risk_rank
+
+FROM rolling_trends rt
+
+LEFT JOIN spike_detection sd
+    ON rt.accident_year = sd.accident_year
+
+LEFT JOIN operator_risk op
+    ON op.operator_risk_rank = 1
+
+LEFT JOIN ranked_states rs
+    ON rs.state_risk_rank = 1
+
+ORDER BY rt.accident_year DESC, rt.accident_month DESC;
